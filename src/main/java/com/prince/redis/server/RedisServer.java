@@ -1,25 +1,34 @@
 package com.prince.redis.server;
 
-import java.io.BufferedReader;
+import com.prince.redis.protocol.RespParser;
+import com.prince.redis.protocol.RespProtocolException;
+import com.prince.redis.protocol.RespValue;
+import com.prince.redis.protocol.RespValue.BulkString;
+import com.prince.redis.protocol.RespValue.RespArray;
+import com.prince.redis.protocol.RespValue.SimpleError;
+import com.prince.redis.protocol.RespValue.SimpleString;
+import com.prince.redis.protocol.RespWriter;
+
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Milestone 1: minimal TCP server.
- * Accepts connections (one virtual thread per client) and answers PING with +PONG.
- * Full RESP parsing arrives in Milestone 2.
+ * TCP server speaking RESP.
+ * <p>
+ * One virtual thread per client. Each request is parsed with {@link RespParser} and each
+ * reply written with {@link RespWriter}. Milestone 2 supports {@code PING}; a proper
+ * command dispatcher arrives in Milestone 3.
  */
 public class RedisServer implements AutoCloseable {
 
     public static final int DEFAULT_PORT = 6379;
-    private static final byte[] PONG = "+PONG\r\n".getBytes(StandardCharsets.US_ASCII);
-    private static final byte[] UNKNOWN = "-ERR unknown command\r\n".getBytes(StandardCharsets.US_ASCII);
+    private static final SimpleString PONG = new SimpleString("PONG");
 
     private final ServerSocket serverSocket;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
@@ -49,26 +58,62 @@ public class RedisServer implements AutoCloseable {
     }
 
     private void handle(Socket client) {
-        try (client;
-             BufferedReader in = new BufferedReader(
-                     new InputStreamReader(client.getInputStream(), StandardCharsets.US_ASCII));
-             OutputStream out = client.getOutputStream()) {
-            String line;
-            while ((line = in.readLine()) != null) {
-                // Skip RESP framing lines ("*1", "$4"); real parser comes in Milestone 2.
-                if (line.isEmpty() || line.startsWith("*") || line.startsWith("$")) {
-                    continue;
+        try (client) {
+            RespParser parser = new RespParser(client.getInputStream());
+            RespWriter writer = new RespWriter(client.getOutputStream());
+            try {
+                RespValue request;
+                while ((request = parser.read()) != null) {
+                    writer.write(execute(request));
+                    // Pipelining: only flush once the client's queued commands are all answered.
+                    if (!parser.hasBufferedInput()) {
+                        writer.flush();
+                    }
                 }
-                if (line.equalsIgnoreCase("PING")) {
-                    out.write(PONG);
-                } else {
-                    out.write(UNKNOWN);
-                }
-                out.flush();
+            } catch (RespProtocolException e) {
+                // Same behaviour as Redis: report the error, then drop the connection.
+                writer.write(new SimpleError("ERR Protocol error: " + e.getMessage()));
+                writer.flush();
             }
         } catch (IOException e) {
             // client disconnected
         }
+    }
+
+    /** Turns a parsed request into a reply. */
+    RespValue execute(RespValue request) {
+        List<String> args = toArgs(request);
+        if (args == null) {
+            return new SimpleError("ERR Protocol error: expected array of bulk strings");
+        }
+        String name = args.get(0).toUpperCase(Locale.ROOT);
+        return switch (name) {
+            case "PING" -> ping(args);
+            default -> new SimpleError("ERR unknown command '" + args.get(0) + "'");
+        };
+    }
+
+    private static RespValue ping(List<String> args) {
+        return switch (args.size()) {
+            case 1 -> PONG;
+            case 2 -> BulkString.of(args.get(1));
+            default -> new SimpleError("ERR wrong number of arguments for 'ping' command");
+        };
+    }
+
+    /** A command is a non-empty array of non-null bulk strings. Returns null otherwise. */
+    private static List<String> toArgs(RespValue request) {
+        if (!(request instanceof RespArray array) || array.isNull() || array.elements().isEmpty()) {
+            return null;
+        }
+        List<String> args = new ArrayList<>(array.elements().size());
+        for (RespValue element : array.elements()) {
+            if (!(element instanceof BulkString bulk) || bulk.isNull()) {
+                return null;
+            }
+            args.add(bulk.asString());
+        }
+        return args;
     }
 
     @Override
